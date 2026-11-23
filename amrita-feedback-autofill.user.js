@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Amrita Course Feedback Auto-Fill
 // @namespace    local
-// @version      6.0
+// @version      6.1
 // @description  Course Feedback: fills every course in one tab and submits. Class TLP Feedback: one tab per subject, filled up to the OTP.
 // @match        https://students.amrita.edu/client/*
 // @grant        GM_openInTab
@@ -25,7 +25,7 @@
 
 (function () {
   'use strict';
-  console.log('[feedback-autofill] v6.0 loaded on', location.href);
+  console.log('[feedback-autofill] v6.1 loaded on', location.href);
 
   // ---------------- Settings ----------------
   const ANSWER = 'Strongly Agree';  // option to pick; if a question doesn't have it, option 1 is picked
@@ -66,7 +66,7 @@
   const L = mk('localStorage'), S = mk('sessionStorage');
   const K_ON = 'af-enabled', K_OPENED = 'af-opened', K_DONE = 'af-done', K_SENT = 'af-otp-sent',
     K_RUN = 'af-run', K_ERR = 'af-errors', K_CHILD = 'af-child',
-    K_QUEUE = 'af-queue', K_WORK = 'af-working', K_HANDED = 'af-handed';
+    K_QUEUE = 'af-queue', K_WORK = 'af-working', K_HANDED = 'af-handed', K_LISTS = 'af-lists-done';
   const enabled = () => L.get(K_ON, true);
 
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -201,20 +201,49 @@
         const link = [...tr.querySelectorAll('a[href*="feedback?"]')].find((a) => /submit feedback/i.test(btnText(a)));
         if (!link) return null;
         const cells = [...tr.children].map((c) => norm(c.innerText));
-        if (cells.some((t) => /^completed$/i.test(t))) return null;
+        if (cells.some((t) => /^(completed|submitted)$/i.test(t))) return null;
         const key = keyOf(new URL(link.href).searchParams);
         const name = cells.filter((t) => t && !/^\d+$/.test(t) && !/submit feedback|^(pending|started)$/i.test(t)).join(' · ') || key;
         return { link, key, name };
       })
       .filter((r) => r && !done[r.key]);
 
-    if (!rows.length) { L.set(K_TRIES, null); return status('✅ Nothing left to fill on this list.'); }
+    // Which lists are finished. A list counts as finished for 12 hours after it was last seen empty.
+    const listsDone = L.get(K_LISTS, {});
+    const other = LISTS.find((p) => p !== path);
+    const NAMES = { '/client/course-feedback-list': 'Course Feedback', '/client/class-feedback': 'Class TLP Feedback' };
+    if (rows.length) { delete listsDone[path]; L.set(K_LISTS, listsDone); }
+
+    if (!rows.length) {
+      L.set(K_TRIES, null);
+      listsDone[path] = Date.now();
+      L.set(K_LISTS, listsDone);
+      const otherDone = listsDone[other] && Date.now() - listsDone[other] < 12 * 60 * 60 * 1000;
+      if (otherDone) {
+        document.title = '✅ Feedback done';
+        return status(`✅ All done: ${NAMES[path]} and ${NAMES[other]} are both complete.`);
+      }
+      // This list is done: go to the other one (with a button in case you want to go now).
+      let left = 5;
+      status(`✅ ${NAMES[path]} is done. Going to ${NAMES[other]} in ${left}s…`);
+      addPanelButton(`Go to ${NAMES[other]} now`, () => navTo(location.origin + other));
+      const timer = setInterval(() => {
+        if (!enabled()) { clearInterval(timer); return status(`✅ ${NAMES[path]} is done. Paused.`); }
+        if (--left <= 0) { clearInterval(timer); navTo(location.origin + other); }
+        else status(`✅ ${NAMES[path]} is done. Going to ${NAMES[other]} in ${left}s…`);
+      }, 1000);
+      return;
+    }
 
     // Course Feedback: everything in this one tab, one course after another (only one OTP).
     if (sameTab) {
       const tries = L.get(K_TRIES, {});
       const todo = rows.find((r) => (tries[r.key] || 0) < MAX_TRIES_PER_ITEM);
-      if (!todo) return status('Could not finish: ' + rows.map((r) => r.name).join('; ') + '. Open these yourself.');
+      if (!todo) {
+        addPanelButton(`Go to ${NAMES[other]}`, () => navTo(location.origin + other));
+        return status('Could not finish: ' + rows.map((r) => r.name).join('; ') +
+          `. Open these yourself, or go on to ${NAMES[other]}.`);
+      }
       tries[todo.key] = (tries[todo.key] || 0) + 1;
       L.set(K_TRIES, tries);
       S.set(K_RUN, null);
@@ -252,8 +281,14 @@
       const q = L.get(K_QUEUE, []);
       if (cur) status(`Filling in another tab: ${cur.name}. ${q.length} more after it. ` +
         'Each tab stops at its OTP, then the next one opens. No tab showing up? Click Pause, then Resume.');
-      else status('All subjects opened. Go tab by tab: SEND OTP, paste the code from your email.');
+      else {
+        status('All subjects opened. Go tab by tab: SEND OTP, paste the code from your email. ' +
+          'This list checks again every minute and moves on once everything says Completed.');
+        // Reload the list now and then, so it notices when the OTPs are all done.
+        if (++idleTicks >= 12) navTo(location.href);
+      }
     };
+    let idleTicks = 0;
     tick();
     setInterval(tick, 5000);
   }
@@ -375,6 +410,14 @@
       handoff();
     };
     heartbeat();
+
+    // Course Feedback has no OTP after Finish, so once Finish is clicked this course is done:
+    // go straight back to the list, whatever the page now shows.
+    if (sameTab && run.finished) {
+      markDone(key);
+      S.set(K_RUN, null);
+      return goList('Course submitted. Back to the list for the next one…');
+    }
 
     // OTP page (before the questions or on the FINISH step): stay here.
     if (!findForm() && isOtpPage()) { keep(); return waitForOtp(); }
@@ -499,7 +542,7 @@
       if (enabled()) { L.set(K_ON, false); b.textContent = 'Resume auto-fill'; status('Paused in every tab.'); }
       else {
         L.set(K_ON, true);
-        for (const k of [K_OPENED, K_DONE, K_QUEUE, K_WORK, K_ATOTP, K_TRIES]) L.set(k, null);
+        for (const k of [K_OPENED, K_DONE, K_QUEUE, K_WORK, K_ATOTP, K_TRIES, K_LISTS]) L.set(k, null);
         location.reload();
       }
     };
@@ -508,6 +551,17 @@
     statusEl.textContent = 'Feedback auto-fill';
     panel.append(b, statusEl);
     document.body.appendChild(panel);
+  }
+
+  function addPanelButton(label, onclick) {
+    const panel = document.getElementById('af-panel');
+    if (!panel || [...panel.querySelectorAll('button')].some((x) => x.textContent === label)) return;
+    const x = document.createElement('button');
+    x.textContent = label;
+    x.style.cssText = 'background:#0f766e;color:#fff;border:0;border-radius:6px;padding:6px 10px;' +
+      'cursor:pointer;font-weight:600;width:auto;margin-left:6px';
+    x.onclick = onclick;
+    panel.insertBefore(x, statusEl);
   }
 
   // ---------- Router ----------
